@@ -1,0 +1,9 @@
+services:
+  backup:
+    build: .
+    image: do-mongo-weekly-backup:local
+    env_file: .env
+    restart: unless-stopped
+    # Example for mounting a CA cert file if needed:
+    # volumes:
+    #   - ./certs/ca.pem:/certs/ca.pem:ro
