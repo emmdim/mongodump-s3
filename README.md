@@ -1,12 +1,13 @@
 # MongoDB Weekly Backups to S3-Compatible Storage
 
-A small, production-practical container that runs `mongodump` on a MongoDB cluster once per week (cron inside the container) and uploads a single-file gzip archive plus a `.sha256` sidecar to any S3-compatible storage (including DigitalOcean Spaces). It also keeps only the last N successful weekly backups per host/prefix.
+A small, production-practical container that runs `mongodump` on a MongoDB cluster, encrypts the archive with a passphrase, and uploads the encrypted artifact plus `.sha256` and `.metadata.json` sidecars to any S3-compatible storage (including DigitalOcean Spaces). It reports retention state without deleting backups.
 
 ## What It Does
 - Runs `mongodump --archive --gzip` against a MongoDB URI.
-- Uploads `mongo-<timestamp>.archive.gz` and `mongo-<timestamp>.archive.gz.sha256` to Spaces.
-- Keeps only the last `RETENTION` backups by filename order (count-based retention).
-- Logs to stdout via a tailed cron log.
+- Encrypts the archive using `gpg` symmetric AES-256.
+- Uploads `mongo-<timestamp>.archive.gz.gpg`, `.sha256`, and `.metadata.json` sidecars to S3-compatible storage.
+- Reports how many backups exist for the current month prefix; deletion is disabled.
+- Logs duration, encryption mode, encrypted size, checksum, and uploaded object keys.
 
 ## Requirements
 - Docker + Docker Compose.
@@ -39,16 +40,28 @@ Required env vars:
 - `SPACE_ENDPOINT`
 - `AWS_ACCESS_KEY_ID`
 - `AWS_SECRET_ACCESS_KEY`
-- `CRON_SCHEDULE`
+- `BACKUP_PASSPHRASE` or `BACKUP_PASSPHRASE_FILE` (recommended from a secret store)
 
 Optional env vars:
+- `CRON_SCHEDULE` (required only when using `entrypoint.sh` cron mode)
 - `TZ` (default `Etc/UTC`)
 - `RETENTION` (default `6`)
-- `HOST_TAG` (default hostname short)
 - `EXTRA_MONGODUMP_ARGS` (default empty; example `--db mydb`)
 - `AWS_S3_FORCE_PATH_STYLE` (default `false`)
 - `MONGO_TLS_CA_FILE` (default empty)
+- `BACKUP_PASSPHRASE_FILE` (default empty; if set, takes precedence over `BACKUP_PASSPHRASE`)
 - `RUN_ON_START` (default `false`)
+
+Restore-only env vars:
+- `S3_OBJECT_KEY` (required by `restore.sh`; example `backups/<YYYY>/<MM>/mongo-<timestamp>.archive.gz.gpg`)
+- `RESTORE_VERIFY_CHECKSUM` (default `true`; fail restore if checksum sidecar is missing or mismatched)
+- `EXTRA_MONGORESTORE_ARGS` (default empty; appended to `mongorestore`)
+
+## DigitalOcean Scheduled Job
+If you run this as a DigitalOcean App Platform scheduled job:
+- Use command: `/app/backup.sh`
+- Do not rely on container-internal cron for scheduling.
+- Configure `BACKUP_PASSPHRASE` as an encrypted App Platform secret.
 
 ## Schedule Examples
 - Europe/Rome (DST-aware with `TZ=Europe/Rome`), weekly on Sunday at 03:15:
@@ -69,22 +82,37 @@ CRON_SCHEDULE=15 3 * * 0
 Objects are written to:
 
 ```
-s3://<SPACE_NAME>/<HOST_TAG>/<YYYY-MM>/mongo-<timestamp>.archive.gz
-s3://<SPACE_NAME>/<HOST_TAG>/<YYYY-MM>/mongo-<timestamp>.archive.gz.sha256
+s3://<SPACE_NAME>/backups/<YYYY>/<MM>/mongo-<timestamp>.archive.gz.gpg
+s3://<SPACE_NAME>/backups/<YYYY>/<MM>/mongo-<timestamp>.archive.gz.gpg.sha256
+s3://<SPACE_NAME>/backups/<YYYY>/<MM>/mongo-<timestamp>.metadata.json
 ```
 
-`<YYYY-MM>` is based on the backup time in UTC. `<timestamp>` is UTC in `YYYYMMDDTHHMMSSZ` format, so lexicographic order matches time order.
+`<YYYY>/<MM>` is based on the backup time in UTC. `<timestamp>` is UTC in `YYYYMMDDTHHMMSSZ` format, so lexicographic order matches time order.
 
 ## Restore Example
-Download and stream-restore an archive:
+Use the restore helper to download, checksum-verify, decrypt, and restore an archive:
 
 ```bash
-aws --endpoint-url <SPACE_ENDPOINT> \
-  s3 cp s3://<SPACE_NAME>/<HOST_TAG>/<YYYY-MM>/mongo-<timestamp>.archive.gz - \
-| mongorestore --archive --gzip --uri "<MONGO_URI>"
+docker compose run --rm \
+  -e S3_OBJECT_KEY="backups/<YYYY>/<MM>/mongo-<timestamp>.archive.gz.gpg" \
+  --entrypoint /app/restore.sh \
+  backup
 ```
 
-Local backup then restore to remote (two-step):
+For one-off local usage inside an environment with `aws`, `gpg`, and `mongorestore` installed:
+
+```bash
+S3_OBJECT_KEY="backups/<YYYY>/<MM>/mongo-<timestamp>.archive.gz.gpg" \
+MONGO_URI="<RESTORE_MONGO_URI>" \
+SPACE_NAME="<SPACE_NAME>" \
+SPACE_ENDPOINT="<SPACE_ENDPOINT>" \
+AWS_ACCESS_KEY_ID="<KEY>" \
+AWS_SECRET_ACCESS_KEY="<SECRET>" \
+BACKUP_PASSPHRASE_FILE="./backup_passphrase.txt" \
+  ./app/restore.sh
+```
+
+Local backup, encrypt it, then restore to remote (two-step):
 
 1. Create a local backup file with `mongodump`:
 
@@ -92,10 +120,19 @@ Local backup then restore to remote (two-step):
 mongodump --uri "<SOURCE_MONGO_URI>" --archive=backup.archive.gz --gzip
 ```
 
-2. Restore that local backup into the remote cluster:
+2. Encrypt and restore that local backup into the remote cluster:
 
 ```bash
-mongorestore --uri "<REMOTE_MONGO_URI>" --archive=backup.archive.gz --gzip
+gpg --batch --yes --pinentry-mode loopback \
+  --symmetric --cipher-algo AES256 \
+  --passphrase-file ./backup_passphrase.txt \
+  --output backup.archive.gz.gpg \
+  backup.archive.gz
+
+gpg --batch --yes --pinentry-mode loopback \
+  --passphrase-file ./backup_passphrase.txt \
+  --decrypt backup.archive.gz.gpg \
+| mongorestore --uri "<REMOTE_MONGO_URI>" --archive --gzip
 ```
 
 ## MongoDB TLS Notes
@@ -114,11 +151,11 @@ volumes:
 ```
 
 ## Retention and Naming Strategy
-- Retention is **count-based**. The script keeps the newest `RETENTION` archives by filename order, and deletes older `.archive.gz` plus matching `.sha256` sidecars.
-- The month segment is always the UTC year-month of the backup (e.g. `2026-02`).
-- Retention is applied within the current month segment (`<HOST_TAG>/<YYYY-MM>`).
-- Set `HOST_TAG` to identify the source host or cluster if you run multiple instances.
-- The AWS CLI paginates `list-objects-v2` automatically, so retention remains correct even with many objects under the prefix.
+- Retention is **report-only**. The script lists matching `.archive.gz.gpg` objects and logs how many exist versus the configured `RETENTION` value, but it does not delete anything.
+- The year/month segments are always based on the UTC backup time (e.g. `2026/05`).
+- The report is scoped to the current month segment (`backups/<YYYY>/<MM>`).
+- Source host information is stored in each backup's metadata sidecar.
+- Delete old backups with a separate, audited process if your production policy allows deletion.
 
 ## Security
 ### Least-Privilege Spaces Credentials
@@ -139,7 +176,7 @@ Create a scoped Spaces access key with permissions limited to the specific bucke
       "Condition": {
         "StringLike": {
           "s3:prefix": [
-            "your-host/????-??/*"
+            "backups/????/??/*"
           ]
         }
       }
@@ -148,11 +185,10 @@ Create a scoped Spaces access key with permissions limited to the specific bucke
       "Effect": "Allow",
       "Action": [
         "s3:GetObject",
-        "s3:PutObject",
-        "s3:DeleteObject"
+        "s3:PutObject"
       ],
       "Resource": [
-        "arn:aws:s3:::your-space-name/your-host/????-??/*"
+        "arn:aws:s3:::your-space-name/backups/????/??/*"
       ]
     }
   ]
@@ -161,13 +197,17 @@ Create a scoped Spaces access key with permissions limited to the specific bucke
 
 ### Secret Handling
 - Do not hardcode credentials.
-- Prefer `env_file` or Docker secrets. The included `docker-compose.yml` uses `.env` via `env_file`.
+- Prefer DigitalOcean App Platform encrypted secrets for scheduled jobs.
+- For Docker runtime, prefer Docker secrets or `env_file` and keep `.env` out of version control.
+- Use a long random passphrase and rotate it with overlap so older backups remain restorable.
 
 ## Troubleshooting
 - **Cron not running**: Ensure `CRON_SCHEDULE` is set and valid. Check logs with `docker compose logs -f`.
 - **Authentication failed (Spaces)**: Verify `SPACE_ENDPOINT`, `SPACE_NAME`, and Spaces access keys.
+- **GPG decryption failed**: Verify `BACKUP_PASSPHRASE` or `BACKUP_PASSPHRASE_FILE` and ensure the restore key matches the backup key used at creation time.
 - **Mongo TLS issues**: Add `tls=true` in `MONGO_URI` or provide a CA file via `MONGO_TLS_CA_FILE`.
-- **Retention deletes too much**: Verify `RETENTION` is a positive integer and your naming format is consistent.
+- **Checksum verification failed during restore**: Ensure the `.sha256` sidecar matches the encrypted archive object. Do not bypass verification unless you have independently verified integrity.
+- **Retention report count looks wrong**: Verify UTC month and object naming format are consistent.
 
 ## Shellcheck
 If you have `shellcheck` locally, run:
